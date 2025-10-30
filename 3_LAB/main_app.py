@@ -521,7 +521,7 @@ class CommunicatorApp(QMainWindow, Ui_MainWindow):
             
             # Отображение данных с подсветкой FCS и стаффинга
             # To correctly identify which bytes were originally data vs FCS after stuffing,
-            # we need to simulate the unstuffing process and track positions
+            # we need to track positions properly
             stuffed_hex = ""
             
             # Create a mapping to track original positions
@@ -529,43 +529,52 @@ class CommunicatorApp(QMainWindow, Ui_MainWindow):
             original_fcs_part = fcs  # Second part is FCS
             original_data_fcs = original_data_part + original_fcs_part  # Combined
             
-            # Simulate what the unstuffing would produce to map positions
-            # We'll iterate through stuffed_data_with_fcs and figure out which original byte each corresponds to
-            unstuffed_byte_idx = 0
-            i = 0
+            # Track the original positions as we iterate through stuffed data
+            orig_data_start = 0
+            orig_data_end = len(original_data_part) - 1  # inclusive end of data
+            orig_fcs_start = len(original_data_part)
+            orig_fcs_end = len(original_data_fcs) - 1  # inclusive end of FCS
+            
+            # Now iterate through stuffed_data_with_fcs and determine which original byte each corresponds to
+            # We'll keep track of where we are in the original data+FCS sequence
+            orig_idx = 0  # Index in the original data+FCS sequence
+            i = 0  # Index in the stuffed data
+            
             while i < len(stuffed_data_with_fcs):
                 current_byte = stuffed_data_with_fcs[i]
                 
-                # Check if this is part of a stuffing sequence
-                is_part_of_stuffing = False
+                # Check if this is the start of a stuffing sequence
+                is_escaped = False
                 if i < len(stuffed_data_with_fcs) - 1:
                     potential_seq = bytes([stuffed_data_with_fcs[i], stuffed_data_with_fcs[i+1]])
                     if potential_seq in self.UNSTUFF_MAP:
-                        is_part_of_stuffing = True
-                        # First byte of sequence is original, second is the stuffing
-                        if i == len(stuffed_data_with_fcs) - 1:  # This shouldn't happen if properly formatted
-                            is_part_of_stuffing = False
-                        
-                if is_part_of_stuffing:
-                    # This is the first byte of a stuffing sequence (original byte)
-                    # Check if it belongs to data or FCS
-                    is_fcs_byte = (unstuffed_byte_idx >= len(original_data_part))
+                        is_escaped = True
+                
+                if is_escaped:
+                    # This is the first byte of an escape sequence, which represents an original byte
+                    # It corresponds to the current orig_idx in our original sequence
+                    is_fcs_byte = (orig_idx >= orig_fcs_start and orig_idx <= orig_fcs_end)
                     
                     if is_fcs_byte:
-                        stuffed_hex += f"<span style='color: orange; font-weight: bold; text-decoration: underline;'>{current_byte:02X}</span> "  # FCS byte
+                        stuffed_hex += f"<span style='color: orange; font-weight: bold; text-decoration: underline;'>{current_byte:02X}</span> "  # FCS byte with underline
                     else:
-                        stuffed_hex += f"<span style='color: red; font-weight: bold;'>{current_byte:02X}</span> "  # Data byte after stuffing
-                    unstuffed_byte_idx += 1
-                    i += 2  # Skip both bytes of the stuffing sequence
+                        stuffed_hex += f"<span style='color: red; font-weight: bold;'>{current_byte:02X}</span> "  # Data byte after stuffing (in red to indicate it might be corrupted)
+                    
+                    # Move to the next original position and skip the escape sequence in stuffed data
+                    orig_idx += 1
+                    i += 2  # Skip both bytes of the escape sequence
                 else:
-                    # This is not part of a stuffing sequence, it's an original byte
-                    is_fcs_byte = (unstuffed_byte_idx >= len(original_data_part))
+                    # This is an original byte, not part of an escape sequence
+                    # It corresponds to the current orig_idx in our original sequence
+                    is_fcs_byte = (orig_idx >= orig_fcs_start and orig_idx <= orig_fcs_end)
                     
                     if is_fcs_byte:
-                        stuffed_hex += f"<span style='color: orange; font-weight: bold; text-decoration: underline;'>{current_byte:02X}</span> "  # FCS byte
+                        stuffed_hex += f"<span style='color: orange; font-weight: bold; text-decoration: underline;'>{current_byte:02X}</span> "  # FCS byte with underline
                     else:
-                        stuffed_hex += f"{current_byte:02X} "  # Regular data byte
-                    unstuffed_byte_idx += 1
+                        stuffed_hex += f"<span style='color: #0066CC;'>{current_byte:02X}</span> "  # Regular data byte (in blue)
+                    
+                    # Move to the next original position and next byte in stuffed data
+                    orig_idx += 1
                     i += 1
 
             display_html += stuffed_hex
@@ -805,15 +814,34 @@ class CommunicatorApp(QMainWindow, Ui_MainWindow):
                 
                 # Process the (potentially corrected) data
                 try:
-                    cleaned_payload = corrected_data.rstrip(b'\x00')
-                    text = cleaned_payload.decode('utf-8', errors='replace')
-                    # Add received packet data with different styling
                     if double_error:
-                        self.output_text_tab2.appendHtml(f"<span style='color: red; font-style: italic;'>[ПАКЕТ С ОШИБКОЙ] {text}</span>")
+                        # For double errors, display only the corrupted content
+                        corrupted_payload = received_data.rstrip(b'\x00')
+                        corrupted_text = corrupted_payload.decode('utf-8', errors='replace')
+                        self.output_text_tab2.appendHtml(f"<span style='color: red; font-style: italic;'>[ПАКЕТ С ДВОЙНОЙ ОШИБКОЙ] {corrupted_text}</span>")
+                        self.log_debug("Обнаружен пакет с двойной ошибкой, невозможно исправить!")
                     elif corrected:
-                        self.output_text_tab2.appendHtml(f"<span style='color: orange; font-style: italic;'>[ПАКЕТ С ИСПРАВЛЕННОЙ ОШИБКОЙ] {text}</span>")
+                        # For single error correction, show in the requested order: 
+                        # 1. Original corrupted content 
+                        # 2. Error indicator
+                        # 3. Corrected content
+                        corrupted_payload = received_data.rstrip(b'\x00')
+                        corrupted_text = corrupted_payload.decode('utf-8', errors='replace')
+                        corrected_payload = corrected_data.rstrip(b'\x00')
+                        corrected_text = corrected_payload.decode('utf-8', errors='replace')
+                        
+                        # Show corrupted content first
+                        self.output_text_tab2.appendHtml(f"<span style='color: red; font-style: italic;'>[ПАКЕТ С ОШИБКОЙ] {corrupted_text}</span>")
+                        # Then show corrected content
+                        self.output_text_tab2.appendHtml(f"<span style='color: orange; font-style: italic;'>[ИСПРАВЛЕННЫЙ ПАКЕТ] {corrected_text}</span>")
+                        
+                        self.log_debug("Пакет с одиночной ошибкой был исправлен.")
                     else:
+                        # No errors
+                        cleaned_payload = corrected_data.rstrip(b'\x00')
+                        text = cleaned_payload.decode('utf-8', errors='replace')
                         self.output_text_tab2.appendHtml(f"<span style='color: #CCCC00; font-style: italic;'>[ПАКЕТ] {text}</span>")
+                    
                     self.log_debug(f"Принят и обработан кадр от порта {source_addr[0]}, извлечено {len(corrected_data)} байт данных.")
                 except UnicodeDecodeError:
                     self.log_debug("Ошибка декодирования принятых данных.")
@@ -904,15 +932,34 @@ class CommunicatorApp(QMainWindow, Ui_MainWindow):
                 
                 # Process the (potentially corrected) data
                 try:
-                    cleaned_payload = corrected_data.rstrip(b'\x00')
-                    text = cleaned_payload.decode('utf-8', errors='replace')
-                    # Add received packet data with different styling
                     if double_error:
-                        self.output_text.appendHtml(f"<span style='color: red; font-style: italic;'>[ПАКЕТ С ОШИБКОЙ] {text}</span>")
+                        # For double errors, display only the corrupted content
+                        corrupted_payload = received_data.rstrip(b'\x00')
+                        corrupted_text = corrupted_payload.decode('utf-8', errors='replace')
+                        self.output_text.appendHtml(f"<span style='color: red; font-style: italic;'>[ПАКЕТ С ДВОЙНОЙ ОШИБКОЙ] {corrupted_text}</span>")
+                        self.log_debug("Обнаружен пакет с двойной ошибкой, невозможно исправить!")
                     elif corrected:
-                        self.output_text.appendHtml(f"<span style='color: orange; font-style: italic;'>[ПАКЕТ С ИСПРАВЛЕННОЙ ОШИБКОЙ] {text}</span>")
+                        # For single error correction, show in the requested order: 
+                        # 1. Original corrupted content 
+                        # 2. Error indicator
+                        # 3. Corrected content
+                        corrupted_payload = received_data.rstrip(b'\x00')
+                        corrupted_text = corrupted_payload.decode('utf-8', errors='replace')
+                        corrected_payload = corrected_data.rstrip(b'\x00')
+                        corrected_text = corrected_payload.decode('utf-8', errors='replace')
+                        
+                        # Show corrupted content first
+                        self.output_text.appendHtml(f"<span style='color: red; font-style: italic;'>[ПАКЕТ С ОШИБКОЙ] {corrupted_text}</span>")
+                        # Then show corrected content
+                        self.output_text.appendHtml(f"<span style='color: orange; font-style: italic;'>[ИСПРАВЛЕННЫЙ ПАКЕТ] {corrected_text}</span>")
+                        
+                        self.log_debug("Пакет с одиночной ошибкой был исправлен.")
                     else:
+                        # No errors
+                        cleaned_payload = corrected_data.rstrip(b'\x00')
+                        text = cleaned_payload.decode('utf-8', errors='replace')
                         self.output_text.appendHtml(f"<span style='color: #CCCC00; font-style: italic;'>[ПАКЕТ] {text}</span>")
+                    
                     self.log_debug(f"Принят и обработан кадр от порта {source_addr[0]}, извлечено {len(corrected_data)} байт данных (экземпляр 2).")
                 except UnicodeDecodeError:
                     self.log_debug("Ошибка декодирования принятых данных (экземпляр 2).")
